@@ -1,0 +1,9 @@
+Compatibility tests for the linux GPIO sysfs interface
+
+This script contains a simple test harness and a comprehensive set of test
+cases that can be used to make sure that the linux GPIO sysfs interface at
+/sys/class/gpio/ exposed by any user-space compatibility layer works as
+expected.
+
+It can of course also be used to just test the existing kernel interface for
+regressions.

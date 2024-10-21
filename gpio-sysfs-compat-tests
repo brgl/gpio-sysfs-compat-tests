@@ -1,0 +1,625 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2024 Bartosz Golaszewski <bartosz.golaszewski@linaro.org>
+
+import errno, os, pwd, re, shutil, stat, sys, time, unittest, uuid
+
+from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+from multiprocessing import Process
+from select import select
+from threading import Thread
+from unittest import TestCase
+
+gpio_class_dir = None
+gpiosim_conf_dir = None
+chown_user = None
+
+
+def read_kern_attr(path):
+    with open(os.path.normpath(path), "r") as fd:
+        return fd.read().strip()
+
+
+def write_kern_attr(path, what):
+    with open(os.path.normpath(path), "w") as fd:
+        fd.write(what)
+
+
+def check_invalid_value(case, gpio, attr, val):
+    with case.assertRaises(OSError) as raised:
+        gpio.write_attr(attr, val)
+
+    case.assertEqual(raised.exception.errno, errno.EINVAL)
+
+
+def get_owner(file):
+    return pwd.getpwuid(os.stat(f"{file}").st_uid).pw_name
+
+
+class IdAllocator:
+    """Manage allocating IDs for GPIO simulator instances."""
+
+    def __init__(self):
+        self._ids = set()
+
+    def get_id(self):
+        for i in range(sys.maxsize):
+            if i not in self._ids:
+                self._ids.add(i)
+                return i
+
+        return 0
+
+    def put_id(self, ida):
+        self._ids.remove(ida)
+
+
+id_allocator = IdAllocator()
+
+
+class Gpiosim:
+
+    def do_init(self, num_lines, label=None):
+        self._live = False
+
+        if num_lines <= 0:
+            raise ValueError("num_lines must not be zero or negative")
+
+        self._conf_dir = (
+            f"gpiod-sysfs-compat-tests-{os.getpid()}-{id_allocator.get_id()}"
+        )
+
+        self._num_lines = num_lines
+        self._label = label
+
+        os.makedirs(f"{gpiosim_conf_dir}{self._conf_dir}/bank")
+
+        write_kern_attr(
+            f"{gpiosim_conf_dir}{self._conf_dir}/bank/num_lines", f"{num_lines}"
+        )
+
+        if label:
+            write_kern_attr(f"{gpiosim_conf_dir}{self._conf_dir}/bank/label", label)
+
+        write_kern_attr(f"{gpiosim_conf_dir}{self._conf_dir}/live", "1")
+
+        self._dev_name = read_kern_attr(f"{gpiosim_conf_dir}{self._conf_dir}/dev_name")
+        self._chip_name = read_kern_attr(
+            f"{gpiosim_conf_dir}{self._conf_dir}/bank/chip_name"
+        )
+        self._dev_path = f"/dev/{self._chip_name}"
+        self._sysfs_path = (
+            f"/sys/bus/platform/devices/{self._dev_name}/{self._chip_name}"
+        )
+
+        if not os.access(self._dev_path, os.F_OK) or not os.access(
+            self._sysfs_path, os.F_OK
+        ):
+            raise FileNotFoundError("GPIO device not created")
+
+        self._class_name = None
+
+        for entry in os.listdir(gpio_class_dir):
+            if os.access(f"{gpio_class_dir}/{entry}/device/{self._chip_name}", os.F_OK):
+                self._class_name = entry
+
+        if not self._class_name:
+            raise FileNotFoundError("GPIO device not created")
+        if not re.match("gpiochip[0-9]+", self._class_name):
+            raise ValueError(f"Invalid GPIO class name for chip: {self._class_name}")
+
+        self._base = int(self._class_name[len("gpiochip") :])
+        self._live = True
+
+    def __init__(self, num_lines, label=None):
+        try:
+            self.do_init(num_lines, label)
+        except:
+            self.do_remove()
+            raise
+
+    def __del__(self):
+        self.remove()
+
+    def do_remove(self):
+        try:
+            write_kern_attr(f"{gpiosim_conf_dir}{self._conf_dir}/live", "0")
+            os.rmdir(f"{gpiosim_conf_dir}{self._conf_dir}/bank")
+            os.rmdir(f"{gpiosim_conf_dir}{self._conf_dir}")
+        except:
+            pass
+
+    def remove(self):
+        if self._live:
+            self.do_remove()
+
+        self._live = False
+
+    def _gpio_to_offset(self, gpio):
+        offset = gpio - self.base
+        if offset < 0 or offset > (self.base + self.num_lines):
+            raise ValueError(f"Invalid gpio number: {gpio}")
+
+        return offset
+
+    def set_pull(self, gpio, pull):
+        if pull < 0 or pull > 1:
+            raise ValueError("Pull must be 0 or 1")
+
+        write_kern_attr(
+            f"{self._sysfs_path}/sim_gpio{self._gpio_to_offset(gpio)}/pull",
+            "pull-up" if pull else "pull-down",
+        )
+
+    def get_value(self, gpio):
+        return int(
+            read_kern_attr(
+                f"{self._sysfs_path}/sim_gpio{self._gpio_to_offset(gpio)}/value"
+            )
+        )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.remove()
+
+    @property
+    def num_lines(self):
+        return self._num_lines
+
+    @property
+    def label(self):
+        return self._label
+
+    @property
+    def class_name(self):
+        return self._class_name
+
+    @property
+    def base(self):
+        return self._base
+
+
+class TestClassLayout(TestCase):
+
+    def test_export_unexport_exist_and_writeable(self):
+        self.assertTrue(os.access(f"{gpio_class_dir}/export", os.W_OK))
+        self.assertTrue(os.access(f"{gpio_class_dir}/unexport", os.W_OK))
+
+
+class TestChipDir(TestCase):
+
+    def setUp(self):
+        self.sim = Gpiosim(num_lines=16, label="foobar")
+
+    def tearDown(self):
+        self.sim.remove()
+
+    def test_chip_attributes(self):
+        chipdir = f"{gpio_class_dir}/{self.sim.class_name}"
+
+        self.assertTrue(os.access(chipdir, os.F_OK))
+
+        for attr in (
+            "base",
+            "device",
+            "label",
+            "ngpio",
+            "power",
+            "subsystem",
+            "uevent",
+        ):
+            self.assertTrue(os.access(f"{chipdir}/{attr}", os.F_OK))
+
+        for attr in ("device", "power", "subsystem"):
+            st = os.stat(f"{chipdir}/{attr}")
+            self.assertTrue(stat.S_ISDIR(st.st_mode))
+
+    def test_cannot_remove_chip_dir(self):
+        with self.assertRaises(OSError) as raised:
+            os.rmdir(f"{gpio_class_dir}/{self.sim.class_name}")
+
+        self.assertEqual(raised.exception.errno, errno.ENOTDIR)
+
+    def test_chip_label(self):
+        self.assertEqual(
+            read_kern_attr(f"{gpio_class_dir}/{self.sim.class_name}/label"),
+            self.sim.label,
+        )
+
+    def test_chip_ngpio(self):
+        self.assertEqual(
+            int(read_kern_attr(f"{gpio_class_dir}/{self.sim.class_name}/ngpio")),
+            self.sim.num_lines,
+        )
+
+    def test_chip_base(self):
+        self.assertEqual(
+            int(read_kern_attr(f"{gpio_class_dir}/{self.sim.class_name}/base")),
+            self.sim.base,
+        )
+
+    def test_chip_write_to_attrs(self):
+        for attr in ["label", "ngpio", "base"]:
+            with self.assertRaises(PermissionError):
+                write_kern_attr(
+                    f"{gpio_class_dir}/{self.sim.class_name}/{attr}", "foobar"
+                )
+
+
+class TestExportUnexport(TestCase):
+
+    def test_export_unexport(self):
+        with Gpiosim(num_lines=8) as sim:
+            gpio = sim.base + 2
+            write_kern_attr(f"{gpio_class_dir}/export", f"{gpio}")
+            self.assertTrue(os.access(f"{gpio_class_dir}/gpio{gpio}", os.F_OK))
+            write_kern_attr(f"{gpio_class_dir}/unexport", f"{gpio}")
+            self.assertFalse(os.access(f"{gpio_class_dir}/gpio{gpio}", os.F_OK))
+
+    def test_export_unexport_invalid_values(self):
+        for attr in ["export", "unexport"]:
+            for val in ["foobar", "-1"]:
+                with self.assertRaises(OSError) as raised:
+                    write_kern_attr(f"{gpio_class_dir}/{attr}", val)
+
+                self.assertEqual(raised.exception.errno, errno.EINVAL)
+
+    def test_cannot_remove_export_unexport(self):
+        for attr in ["export", "unexport"]:
+            with self.assertRaises(OSError) as raised:
+                os.remove(f"{gpio_class_dir}/{attr}")
+
+            self.assertEqual(raised.exception.errno, errno.EPERM)
+
+
+class GpioExporter:
+    """Automate unexporting of GPIOs in test cases"""
+
+    def __init__(self, gpio):
+        self._gpio = gpio
+        write_kern_attr(f"{gpio_class_dir}/export", f"{self._gpio}")
+
+    def unexport(self):
+        if self._gpio:
+            try:
+                write_kern_attr(f"{gpio_class_dir}/unexport", f"{self._gpio}")
+                self._gpio = None
+            except:
+                pass
+
+    def __del__(self):
+        self.unexport()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.unexport()
+
+    @property
+    def num(self):
+        return self._gpio
+
+    @property
+    def dir(self):
+        return f"{gpio_class_dir}/gpio{self._gpio}"
+
+    def read_attr(self, attr):
+        return read_kern_attr(f"{self.dir}/{attr}")
+
+    def write_attr(self, attr, val):
+        write_kern_attr(f"{self.dir}/{attr}", val)
+
+
+class TestGpioDir(TestCase):
+
+    def setUp(self):
+        self.sim = Gpiosim(num_lines=8)
+        self.gpio = GpioExporter(self.sim.base)
+
+    def tearDown(self):
+        self.gpio.unexport()
+        self.sim.remove()
+
+    def test_gpio_attributes(self):
+        self.assertTrue(os.access(self.gpio.dir, os.F_OK))
+
+        for attr in [
+            "active_low",
+            "device",
+            "direction",
+            "edge",
+            "power",
+            "subsystem",
+            "uevent",
+            "value",
+        ]:
+            self.assertTrue(os.access(f"{self.gpio.dir}/{attr}", os.F_OK))
+
+        for attr in ["device", "power", "subsystem"]:
+            st = os.stat(f"{self.gpio.dir}/{attr}")
+            self.assertTrue(stat.S_ISDIR(st.st_mode))
+
+    def test_cannot_remove_gpio_dir(self):
+        with self.assertRaises(OSError) as raised:
+            os.rmdir(f"{self.gpio.dir}")
+
+        self.assertEqual(raised.exception.errno, errno.ENOTDIR)
+
+    def test_direction(self):
+        self.assertEqual(self.gpio.read_attr("direction"), "in")
+        self.gpio.write_attr("direction", "out")
+        self.assertEqual(self.gpio.read_attr("direction"), "out")
+
+    def test_direction_invalid_value(self):
+        for val in ["foo", "0", "1", "-1"]:
+            check_invalid_value(self, self.gpio, "direction", val)
+
+    def test_gpio_get_value(self):
+        self.assertEqual(self.gpio.read_attr("value"), "0")
+        self.sim.set_pull(self.gpio.num, 1)
+        self.assertEqual(self.gpio.read_attr("value"), "1")
+        self.sim.set_pull(self.gpio.num, 0)
+        self.assertEqual(self.gpio.read_attr("value"), "0")
+
+    def test_gpio_set_value_input_fails(self):
+        self.gpio.write_attr("direction", "in")
+
+        with self.assertRaises(OSError) as raised:
+            self.gpio.write_attr("value", "1")
+
+        self.assertEqual(raised.exception.errno, errno.EPERM)
+
+    def test_gpio_set_value(self):
+        self.assertEqual(self.sim.get_value(self.gpio.num), 0)
+        self.gpio.write_attr("direction", "out")
+        self.gpio.write_attr("value", "1")
+        self.assertEqual(self.sim.get_value(self.gpio.num), 1)
+
+    def test_gpio_set_value_invalid(self):
+        self.gpio.write_attr("direction", "out")
+        check_invalid_value(self, self.gpio, "value", "foo")
+
+    def test_active_low(self):
+        self.assertEqual(self.gpio.read_attr("value"), "0")
+        self.gpio.write_attr("active_low", "1")
+        self.assertEqual(self.gpio.read_attr("value"), "1")
+        self.gpio.write_attr("active_low", "0")
+        self.assertEqual(self.gpio.read_attr("value"), "0")
+
+    def test_active_low_invalid_value(self):
+        check_invalid_value(self, self.gpio, "active_low", "foo")
+
+    def test_edge_invalid_value(self):
+        check_invalid_value(self, self.gpio, "edge", "foo")
+
+    def test_edge_good_values(self):
+        self.assertEqual(self.gpio.read_attr("edge"), "none")
+        self.gpio.write_attr("edge", "rising")
+        self.assertEqual(self.gpio.read_attr("edge"), "rising")
+        self.gpio.write_attr("edge", "falling")
+        self.assertEqual(self.gpio.read_attr("edge"), "falling")
+        self.gpio.write_attr("edge", "both")
+        self.assertEqual(self.gpio.read_attr("edge"), "both")
+        self.gpio.write_attr("edge", "none")
+        self.assertEqual(self.gpio.read_attr("edge"), "none")
+
+    class ValToggler(Thread):
+
+        def __init__(self, gpio, sim):
+            self.go = True
+            self.gpio = gpio
+            self.sim = sim
+            Thread.__init__(self)
+
+        def stop(self):
+            self.go = False
+
+        def run(self):
+            val = 1
+
+            while self.go:
+                time.sleep(0.2)
+                self.sim.set_pull(self.gpio.num, val)
+                val = 0 if val else 1
+
+    def check_edges(self, edge):
+        self.gpio.write_attr("direction", "in")
+        self.gpio.write_attr("edge", edge)
+
+        got_rising = got_falling = False
+
+        thread = self.ValToggler(self.gpio, self.sim)
+        thread.start()
+
+        try:
+            with open(f"{self.gpio.dir}/value", "r") as fd:
+                self.assertEqual(fd.read().strip(), "0")
+
+                for _ in range(2):
+                    _, _, ex = select([], [], [fd], 0.5)
+                    if fd not in ex:
+                        continue
+
+                    fd.seek(0)
+                    val = fd.read().strip()
+                    if val == "0":
+                        got_falling = True
+                    elif val == "1":
+                        got_rising = True
+        finally:
+            thread.stop()
+            thread.join()
+
+        return (got_rising, got_falling)
+
+    def test_poll_edge_both(self):
+        got_rising, got_falling = self.check_edges("both")
+        self.assertTrue(got_rising and got_falling)
+
+    def test_poll_edge_rising(self):
+        got_rising, got_falling = self.check_edges("rising")
+        self.assertTrue(got_rising)
+        self.assertFalse(got_falling)
+
+    def test_poll_edge_falling(self):
+        got_rising, got_falling = self.check_edges("falling")
+        self.assertFalse(got_rising)
+        self.assertTrue(got_falling)
+
+    def test_poll_edge_none(self):
+        got_rising, got_falling = self.check_edges("none")
+        self.assertFalse(got_rising or got_falling)
+
+
+class TestUeventAttr(TestCase):
+
+    def setUp(self):
+        self.sim = Gpiosim(num_lines=4)
+        self.gpio = GpioExporter(self.sim.base + 3)
+
+    def tearDown(self):
+        self.gpio.unexport()
+        self.sim.remove()
+
+    def test_uevent_read(self):
+        for group in [self.sim.class_name, f"gpio{self.gpio.num}"]:
+            self.assertEqual(self.gpio.read_attr("uevent"), "")
+
+    def test_chip_write_uevent_invalid_value(self):
+        for group in [self.sim.class_name, f"gpio{self.gpio.num}"]:
+            with self.assertRaises(OSError) as raised:
+                self.gpio.write_attr("uevent", "foobar")
+
+            self.assertEqual(raised.exception.errno, errno.EINVAL)
+
+    def test_chip_write_uevent_synth_uevent(self):
+        # Caveat: this really just tests the acceptance of the string of given
+        # format by the uevent attribute. It doesn't test whether the synthetic
+        # uevent is actually generated and its contents. Not should it as any
+        # user-space compatibility layer won't be able to generate a uevent
+        # anyway.
+        for action in [
+            "add",
+            "remove",
+            "change",
+            "move",
+            "online",
+            "offline",
+            "bind",
+            "unbind",
+        ]:
+            for group in [self.sim.class_name, f"gpio{self.gpio.num}"]:
+                self.gpio.write_attr("uevent", f"{action} {str(uuid.uuid4())} A=1 B=2")
+
+
+class TestChangeOwner(TestCase):
+
+    def setUp(self):
+        if not chown_user:
+            self.skipTest("no user set for chown")
+
+    def test_chown_export_unexport(self):
+        for attr in ["export", "unexport"]:
+            self.assertEqual(get_owner(f"{gpio_class_dir}/{attr}"), "root")
+
+        try:
+            for attr in ["export", "unexport"]:
+                path = f"{gpio_class_dir}/{attr}"
+                shutil.chown(path, user=chown_user, group=chown_user)
+                self.assertEqual(get_owner(path), chown_user)
+
+            # Make sure the user can now request and release GPIOs
+            def export_as_user(user):
+                os.setuid(pwd.getpwnam(user).pw_uid)
+
+                try:
+                    with GpioExporter(sim.base + 2):
+                        pass
+
+                    status = 0
+                except Exception as ex:
+                    status = 1
+
+                sys.exit(status)
+
+            with Gpiosim(num_lines=4) as sim:
+                proc = Process(target=export_as_user, args=(chown_user,))
+                proc.start()
+                proc.join()
+                self.assertEqual(proc.exitcode, 0)
+        finally:
+            for attr in ["export", "unexport"]:
+                shutil.chown(f"{gpio_class_dir}/{attr}", user="root", group="root")
+
+
+class TestCornerCases(TestCase):
+
+    def test_remove_before_unexporting(self):
+        with Gpiosim(num_lines=8) as sim:
+            gpio = GpioExporter(sim.base + 4)
+
+        self.assertFalse(os.access(f"{gpio_class_dir}/gpio.gpio.num", os.F_OK))
+
+
+def check_dir_access(path):
+    if not os.access(path, os.F_OK):
+        raise FileNotFoundError(f"{path} not found, unable to run tests")
+    if not os.access(path, os.R_OK | os.W_OK):
+        raise PermissionError(f"{path} - permission denied")
+
+
+def main():
+    global gpio_class_dir, gpiosim_conf_dir, chown_user
+    verbosity = 1
+
+    parser = ArgumentParser(
+        prog="gpio-sysfs-compat-tests",
+        description="Test suite for the linux GPIO sysfs interface. Allows to "
+        "ensure the conformity of any user-space compatibility layer with the "
+        "kernel baseline.",
+        formatter_class=ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("-v", "--verbose", help="Verbose output", action="store_true")
+    parser.add_argument("-q", "--quiet", help="Quiet output", action="store_true")
+    parser.add_argument(
+        "--gpio-class",
+        help="Where the GPIO class is",
+        default="/sys/class/gpio/",
+        dest="gpio_class_dir",
+        action="store",
+    )
+    parser.add_argument(
+        "--gpiosim-configfs",
+        help="Where the gpiosim configfs directory is",
+        default="/sys/kernel/config/gpio-sim/",
+        dest="gpiosim_conf_dir",
+        action="store",
+    )
+    parser.add_argument(
+        "--chown-user",
+        help="User to use for chown tests (if None, chown tests will be skipped)",
+    )
+
+    args = parser.parse_args()
+    gpio_class_dir = args.gpio_class_dir
+    gpiosim_conf_dir = args.gpiosim_conf_dir
+    chown_user = args.chown_user
+
+    if args.verbose:
+        verbosity = 2
+    elif args.quiet:
+        verbosity = 0
+
+    # Before even running any tests, see if /sys/class/gpio exists at all
+    check_dir_access(gpio_class_dir)
+    # Check if gpio-sim is loaded
+    check_dir_access(gpiosim_conf_dir)
+
+    unittest.main(argv=[sys.argv[0]], verbosity=verbosity)
+
+
+if __name__ == "__main__":
+    main()
