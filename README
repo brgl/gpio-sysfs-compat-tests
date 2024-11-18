@@ -7,3 +7,7 @@ expected.
 
 It can of course also be used to just test the existing kernel interface for
 regressions.
+
+The script depends exclusively on modules available in the python standard
+library and requires the kernel gpio-sim module to be available and loaded
+before running.
