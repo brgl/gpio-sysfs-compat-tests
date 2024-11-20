@@ -187,6 +187,13 @@ class TestClassLayout(TestCase):
         self.assertTrue(os.access(f"{gpio_class_dir}/export", os.W_OK))
         self.assertTrue(os.access(f"{gpio_class_dir}/unexport", os.W_OK))
 
+    def test_cannot_remove_export_unexport(self):
+        for attr in ["export", "unexport"]:
+            with self.assertRaises(OSError) as raised:
+                os.remove(f"{gpio_class_dir}/{attr}")
+
+            self.assertEqual(raised.exception.errno, errno.EPERM)
+
 
 class TestChipDir(TestCase):
 
@@ -265,13 +272,6 @@ class TestExportUnexport(TestCase):
                     write_kern_attr(f"{gpio_class_dir}/{attr}", val)
 
                 self.assertEqual(raised.exception.errno, errno.EINVAL)
-
-    def test_cannot_remove_export_unexport(self):
-        for attr in ["export", "unexport"]:
-            with self.assertRaises(OSError) as raised:
-                os.remove(f"{gpio_class_dir}/{attr}")
-
-            self.assertEqual(raised.exception.errno, errno.EPERM)
 
     def test_chip_dir_really_disappears(self):
         with Gpiosim(num_lines=4) as sim:
