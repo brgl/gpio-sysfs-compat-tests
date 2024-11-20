@@ -194,6 +194,19 @@ class TestClassLayout(TestCase):
 
             self.assertEqual(raised.exception.errno, errno.EPERM)
 
+    def test_cannot_create_new_file_in_class(self):
+        with self.assertRaises(OSError) as raised:
+            with open(f"{gpio_class_dir}/foo", "w"):
+                pass
+
+        self.assertEqual(raised.exception.errno, errno.EACCES)
+
+    def test_cannot_mkdir_in_class(self):
+        with self.assertRaises(OSError) as raised:
+            os.mkdir(f"{gpio_class_dir}/foo")
+
+        self.assertEqual(raised.exception.errno, errno.EPERM)
+
 
 class TestChipDir(TestCase):
 
