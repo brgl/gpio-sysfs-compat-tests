@@ -126,7 +126,7 @@ class Gpiosim:
             write_kern_attr(f"{gpiosim_conf_dir}{self._conf_dir}/live", "0")
             os.rmdir(f"{gpiosim_conf_dir}{self._conf_dir}/bank")
             os.rmdir(f"{gpiosim_conf_dir}{self._conf_dir}")
-        except:
+        except Exception:
             pass
 
     def remove(self):
@@ -313,7 +313,7 @@ class GpioExporter:
             try:
                 write_kern_attr(f"{gpio_class_dir}/unexport", f"{self._gpio}")
                 self._gpio = None
-            except:
+            except Exception:
                 pass
 
     def __del__(self):
