@@ -293,6 +293,13 @@ class TestExportUnexport(TestCase):
 
         self.assertFalse(os.access(path, os.F_OK))
 
+    def test_gpio_dir_really_disappears(self):
+        with Gpiosim(num_lines=4) as sim:
+            with GpioExporter(sim.base + 3) as gpio:
+                self.assertTrue(os.access(gpio.dir, os.F_OK))
+
+            self.assertFalse(os.access(gpio.dir, os.F_OK))
+
 
 class GpioExporter:
     """Automate unexporting of GPIOs in test cases"""
