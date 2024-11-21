@@ -567,7 +567,7 @@ class TestChangeOwner(TestCase):
                         pass
 
                     status = 0
-                except Exception as ex:
+                except Exception:
                     status = 1
 
                 sys.exit(status)
