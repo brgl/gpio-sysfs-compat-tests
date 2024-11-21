@@ -584,11 +584,13 @@ class TestChangeOwner(TestCase):
 
 class TestCornerCases(TestCase):
 
-    def test_remove_before_unexporting(self):
+    def test_remove_chip_before_unexporting_its_gpio(self):
         with Gpiosim(num_lines=8) as sim:
             gpio = GpioExporter(sim.base + 4)
+            self.assertTrue(os.access(gpio.dir, os.F_OK))
 
-        self.assertFalse(os.access(f"{gpio_class_dir}/gpio.gpio.num", os.F_OK))
+        self.assertFalse(os.access(gpio.dir, os.F_OK))
+        del gpio
 
 
 def check_dir_access(path):
