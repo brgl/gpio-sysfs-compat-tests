@@ -18,6 +18,20 @@ from select import select
 from threading import Thread
 from unittest import TestCase
 
+DIR_MODE = (
+    stat.S_IFDIR
+    | stat.S_IRUSR
+    | stat.S_IWUSR
+    | stat.S_IXUSR
+    | stat.S_IRGRP
+    | stat.S_IXGRP
+    | stat.S_IROTH
+    | stat.S_IXOTH
+)
+RO_ATTR_MODE = stat.S_IFREG | stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH
+RW_ATTR_MODE = stat.S_IFREG | stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH
+EXP_UNEXP_MODE = stat.S_IFREG | stat.S_IWUSR
+
 gpio_class_dir = None
 gpiosim_conf_dir = None
 chown_user = None
@@ -42,6 +56,11 @@ def check_invalid_value(case, gpio, attr, val):
 
 def get_owner(file):
     return pwd.getpwuid(os.stat(f"{file}").st_uid).pw_name
+
+
+def check_file_mode(case, path, expected):
+    mode = os.stat(path).st_mode
+    case.assertEqual(mode, expected)
 
 
 class IdAllocator:
@@ -215,6 +234,10 @@ class TestClassLayout(TestCase):
 
         self.assertEqual(raised.exception.errno, errno.EPERM)
 
+    def test_export_unexport_mode(self):
+        for attr in ["export", "unexport"]:
+            check_file_mode(self, f"{gpio_class_dir}/{attr}", EXP_UNEXP_MODE)
+
 
 class TestChipDir(TestCase):
 
@@ -240,9 +263,13 @@ class TestChipDir(TestCase):
         ):
             self.assertTrue(os.access(f"{chipdir}/{attr}", os.F_OK))
 
-        for attr in ("device", "power", "subsystem"):
-            st = os.stat(f"{chipdir}/{attr}")
-            self.assertTrue(stat.S_ISDIR(st.st_mode))
+        for attr in ["base", "label", "ngpio"]:
+            check_file_mode(self, f"{chipdir}/{attr}", RO_ATTR_MODE)
+
+        check_file_mode(self, f"{chipdir}/uevent", RW_ATTR_MODE)
+
+        for attr in ["device", "power", "subsystem"]:
+            check_file_mode(self, f"{chipdir}/{attr}", DIR_MODE)
 
     def test_cannot_remove_chip_dir(self):
         with self.assertRaises(OSError) as raised:
@@ -373,9 +400,11 @@ class TestGpioDir(TestCase):
         ]:
             self.assertTrue(os.access(f"{self.gpio.dir}/{attr}", os.F_OK))
 
+        for attr in ["active_low", "direction", "edge", "uevent", "value"]:
+            check_file_mode(self, f"{self.gpio.dir}/{attr}", RW_ATTR_MODE)
+
         for attr in ["device", "power", "subsystem"]:
-            st = os.stat(f"{self.gpio.dir}/{attr}")
-            self.assertTrue(stat.S_ISDIR(st.st_mode))
+            check_file_mode(self, f"{self.gpio.dir}/{attr}", DIR_MODE)
 
     def test_cannot_remove_gpio_dir(self):
         with self.assertRaises(OSError) as raised:
