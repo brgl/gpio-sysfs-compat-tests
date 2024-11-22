@@ -252,7 +252,7 @@ class TestChipDir(TestCase):
 
         self.assertTrue(os.access(chipdir, os.F_OK))
 
-        for attr in (
+        for attr in [
             "base",
             "device",
             "label",
@@ -260,7 +260,7 @@ class TestChipDir(TestCase):
             "power",
             "subsystem",
             "uevent",
-        ):
+        ]:
             self.assertTrue(os.access(f"{chipdir}/{attr}", os.F_OK))
 
         for attr in ["base", "label", "ngpio"]:
