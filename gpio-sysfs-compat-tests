@@ -126,9 +126,17 @@ class Gpiosim:
 
         self._class_name = None
 
-        for entry in os.listdir(gpio_class_dir):
-            if os.access(f"{gpio_class_dir}/{entry}/device/{self._chip_name}", os.F_OK):
-                self._class_name = entry
+        def find_class_dir(chip_name):
+            for entry in os.listdir(gpio_class_dir):
+                if os.access(f"{gpio_class_dir}/{entry}/device/{chip_name}", os.F_OK):
+                    return entry
+
+        for _ in range(10):
+            self._class_name = find_class_dir(self._chip_name)
+            if self._class_name:
+                break
+
+            time.sleep(0.1)
 
         if not self._class_name:
             raise FileNotFoundError("GPIO device not created")
