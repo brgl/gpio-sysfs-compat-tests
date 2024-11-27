@@ -161,6 +161,11 @@ class Gpiosim:
             write_kern_attr(f"{gpiosim_conf_dir}{self._conf_dir}/live", "0")
             os.rmdir(f"{gpiosim_conf_dir}{self._conf_dir}/bank")
             os.rmdir(f"{gpiosim_conf_dir}{self._conf_dir}")
+            for _ in range(10):
+                if not os.access(f"{gpio_class_dir}/{self._class_name}", os.F_OK):
+                    break
+
+                time.sleep(0.1)
         except Exception:
             pass
 
